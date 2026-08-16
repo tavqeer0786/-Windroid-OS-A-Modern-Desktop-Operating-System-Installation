@@ -159,10 +159,10 @@ except Exception as e:
             # Clean temporary profile if necessary
             rm -rf /tmp/windroid-chromium-profile 2>/dev/null || true
 
-            # Verify Native System Bridge on 127.0.0.1:4174 (Managed by systemd windroid-bridge.service or local daemon)
+            # Verify Native System Bridge on 127.0.0.1:4174 (Authoritatively managed by systemd windroid-bridge.service)
             echo "[Windroid OS] Verifying Native System Bridge on 127.0.0.1:4174..." >> "$SHELL_LOG"
             BRIDGE_READY=0
-            for i in $(seq 1 8); do
+            for i in $(seq 1 10); do
                 if command -v systemctl >/dev/null 2>&1; then
                     if ! systemctl is-active --quiet windroid-bridge.service 2>/dev/null; then
                         systemctl start windroid-bridge.service 2>/dev/null || sudo systemctl start windroid-bridge.service 2>/dev/null || true
@@ -176,34 +176,13 @@ except Exception as e:
                     BRIDGE_READY=1
                     break
                 fi
-                sleep 1
+                sleep 0.5
             done
-
-            # If still not ready, launch local bridge process fallback
-            if [ "$BRIDGE_READY" -eq 0 ]; then
-                BRIDGE_BIN="/usr/bin/windroid-bridge.py"
-                if [ ! -f "$BRIDGE_BIN" ]; then
-                    BRIDGE_BIN="$(dirname "$0")/windroid-bridge.py"
-                fi
-                if [ -f "$BRIDGE_BIN" ]; then
-                    echo "[Windroid OS] Starting local bridge fallback: $BRIDGE_BIN" >> "$SHELL_LOG"
-                    python3 "$BRIDGE_BIN" > "$BRIDGE_LOG" 2>&1 &
-                    BRIDGE_PID=$!
-                    sleep 1
-                    for i in $(seq 1 5); do
-                        if python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4174/api/health')" >/dev/null 2>&1; then
-                            BRIDGE_READY=1
-                            break
-                        fi
-                        sleep 1
-                    done
-                fi
-            fi
 
             if [ "$BRIDGE_READY" -eq 1 ]; then
                 echo "[Windroid OS] Native System Bridge is ready at http://127.0.0.1:4174/" >> "$SHELL_LOG"
             else
-                echo "[WARNING] System Bridge did not respond on 127.0.0.1:4174. Continuing startup with shell retry logic." >> "$SHELL_LOG"
+                echo "[WARNING] System Bridge did not respond on 127.0.0.1:4174 via systemd. Proceeding without rogue spawn." >> "$SHELL_LOG"
             fi
 
             echo "[Windroid OS] Starting local HTTP server on port 4173..." >> "$SHELL_LOG"

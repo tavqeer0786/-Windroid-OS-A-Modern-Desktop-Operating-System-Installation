@@ -261,8 +261,11 @@ def save_installer_state_atomic(state_data: dict, target_root: str = "/") -> boo
             f.flush()
             os.fsync(f.fileno())
 
+        os.chmod(tmp_file, 0o644)
         os.replace(tmp_file, target_file)
+        os.chmod(target_file, 0o644)
         shutil.copy2(target_file, backup_file)
+        os.chmod(backup_file, 0o644)
 
         # Fsync parent directory
         dir_fd = os.open(target_dir, os.O_DIRECTORY)
