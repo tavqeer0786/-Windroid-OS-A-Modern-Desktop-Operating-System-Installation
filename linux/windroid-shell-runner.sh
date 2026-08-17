@@ -56,37 +56,64 @@ while true; do
     STATE_EVAL=$(python3 -c "
 import json, os, re, subprocess
 
-STATE_FILE = '/var/lib/windroid/installer-state.json'
+P_FILE = '/var/lib/windroid/installer-state.json'
+B_FILE = '/var/lib/windroid/installation-state.json'
 VALID_STATES = ['INSTALLER', 'INSTALLATION_IN_PROGRESS', 'INSTALLATION_COMPLETE', 'OOBE_PENDING', 'OOBE_IN_PROGRESS', 'OOBE_COMPLETE', 'DESKTOP_READY', 'FAILED']
 
-if not os.path.exists(STATE_FILE):
-    print('MISSING|none|none')
+def load_data(filepath):
+    if not os.path.exists(filepath):
+        return None
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, dict) and data.get('version') == 'windroid-installer-state-v1' and data.get('state') in VALID_STATES:
+            return data
+    except Exception:
+        pass
+    return None
+
+p_data = load_data(P_FILE)
+b_data = load_data(B_FILE)
+
+chosen_data = None
+if p_data and b_data:
+    p_gen = int(p_data.get('generation', 0) or 0)
+    b_gen = int(b_data.get('generation', 0) or 0)
+    chosen_data = b_data if b_gen > p_gen else p_data
+elif p_data:
+    chosen_data = p_data
+elif b_data:
+    chosen_data = b_data
+
+if not chosen_data:
+    if not os.path.exists(P_FILE) and not os.path.exists(B_FILE):
+        print('MISSING|none|no')
+    else:
+        print('CORRUPT|none|no')
     exit(0)
 
-try:
-    with open(STATE_FILE, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-    if not isinstance(data, dict) or data.get('version') != 'windroid-installer-state-v1':
-        print('CORRUPT|none|none')
-        exit(0)
-    state = data.get('state')
-    if state not in VALID_STATES:
-        print('INVALID|none|none')
-        exit(0)
-    u_cfg = data.get('userConfig') or {}
-    username = str(u_cfg.get('username', '')).strip()
-    
-    # Check if user exists in system passwd
-    user_ok = 'no'
-    if username and username not in ['root', 'user', 'windroid-oobe']:
-        res = subprocess.run(['getent', 'passwd', username], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if res.returncode == 0 and res.stdout.strip():
+state = chosen_data.get('state', 'INVALID')
+u_cfg = chosen_data.get('userConfig') or {}
+username = str(u_cfg.get('username', '')).strip()
+
+user_ok = 'no'
+if username and username not in ['root', 'user', 'windroid-oobe']:
+    res = subprocess.run(['getent', 'passwd', username], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if res.returncode == 0 and res.stdout.strip():
+        parts = res.stdout.strip().split(':')
+        if len(parts) >= 7:
+            try:
+                uid = int(parts[2])
+                home_dir = parts[5]
+                if (uid >= 1000 or username == 'root') and os.path.exists(home_dir):
+                    user_ok = 'yes'
+            except Exception:
+                pass
+        elif os.path.exists(f'/home/{username}'):
             user_ok = 'yes'
-            
-    print(f'{state}|{username}|{user_ok}')
-except Exception as e:
-    print('ERROR|none|none')
-" 2>/dev/null || echo "ERROR|none|none")
+
+print(f'{state}|{username}|{user_ok}')
+" 2>/dev/null || echo "ERROR|none|no")
 
     NATIVE_STATE=$(echo "$STATE_EVAL" | cut -d'|' -f1)
     NATIVE_USER=$(echo "$STATE_EVAL" | cut -d'|' -f2)

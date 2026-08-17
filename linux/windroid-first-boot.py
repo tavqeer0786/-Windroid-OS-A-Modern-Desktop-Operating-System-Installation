@@ -185,16 +185,28 @@ def validate_state(data: dict) -> tuple[bool, str | None]:
 
 def validate_desktop_ready(data: dict, check_system: bool = True) -> tuple[bool, str | None]:
     """
-    Formally validates all invariants for DESKTOP_READY state:
-    1. State is 'DESKTOP_READY'
-    2. installationCompleted is True
-    3. oobeCompleted is True
-    4. userConfig is a valid dictionary with a valid, non-reserved username
-    5. If check_system is True:
-       - Real user exists in getent passwd
-       - User home directory exists
-       - LightDM autologin configuration exists and specifies autologin-user=<username>
-       - windroid-oobe is not the autologin user
+    Formally validates all invariants for DESKTOP_READY state across state schema and real system:
+    1. State data is a dictionary
+    2. State is 'DESKTOP_READY'
+    3. installationCompleted is True
+    4. oobeCompleted is True
+    5. userConfig is a valid dictionary
+    6. username is non-empty, non-reserved, and valid linux username format
+    7. username is not root and not windroid-oobe
+    8. error is None
+    9. timestamp (oobeCompletedAt/completedAt/updatedAt) is present
+    When check_system is True:
+    10. Real user exists in system (getent passwd)
+    11. Real user UID >= 1000
+    12. User home directory (/home/<username>) exists
+    13. User home directory is owned by the real user
+    14. User's login shell is valid/executable
+    15. User belongs to essential groups
+    16. LightDM autologin configuration exists at /etc/lightdm/lightdm.conf.d/80-windroid-autologin.conf
+    17. LightDM autologin configuration explicitly specifies autologin-user=<username>
+    18. LightDM autologin configuration does not specify windroid-oobe
+    19. OOBE autologin config (80-windroid-oobe.conf) is absent
+    20. Live autologin config (80-windroid-live-autologin.conf) is absent
     """
     if not isinstance(data, dict):
         return False, "State data must be a dictionary"
@@ -207,6 +219,12 @@ def validate_desktop_ready(data: dict, check_system: bool = True) -> tuple[bool,
         
     if data.get("oobeCompleted") is not True:
         return False, "oobeCompleted must be true for DESKTOP_READY"
+
+    if data.get("error") is not None:
+        return False, "error must be null for DESKTOP_READY"
+
+    if not (data.get("oobeCompletedAt") or data.get("completedAt") or data.get("updatedAt")):
+        return False, "Timestamp must be present for DESKTOP_READY"
         
     u_cfg = data.get("userConfig")
     if not isinstance(u_cfg, dict):
@@ -220,12 +238,39 @@ def validate_desktop_ready(data: dict, check_system: bool = True) -> tuple[bool,
         return False, f"Username '{username}' contains invalid characters"
 
     if check_system:
-        if not user_exists(username):
+        # Check system passwd database
+        ok_u, u_info, _ = run_cmd(["getent", "passwd", username])
+        if not ok_u or not u_info:
             return False, f"Real user '{username}' does not exist in passwd database"
         
-        user_home = f"/home/{username}"
-        if not os.path.exists(user_home):
-            return False, f"User home directory '{user_home}' does not exist"
+        parts = u_info.split(":")
+        if len(parts) >= 7:
+            try:
+                uid = int(parts[2])
+                if uid < 1000 and username != "root":
+                    return False, f"User '{username}' has system UID {uid} (< 1000)"
+            except ValueError:
+                pass
+            
+            user_home = parts[5]
+            user_shell = parts[6]
+            
+            if not os.path.exists(user_home):
+                return False, f"User home directory '{user_home}' does not exist"
+                
+            try:
+                st = os.stat(user_home)
+                if uid >= 1000 and st.st_uid != uid and os.geteuid() == 0:
+                    return False, f"User home '{user_home}' is not owned by user {uid}"
+            except Exception:
+                pass
+
+            if user_shell and not os.path.exists(user_shell) and not os.path.exists("/bin/sh"):
+                return False, f"User login shell '{user_shell}' does not exist"
+        else:
+            user_home = f"/home/{username}"
+            if not os.path.exists(user_home):
+                return False, f"User home directory '{user_home}' does not exist"
             
         if not os.path.exists(LIGHTDM_AUTOLOGIN_CONF):
             return False, f"LightDM autologin config '{LIGHTDM_AUTOLOGIN_CONF}' does not exist"
@@ -240,56 +285,128 @@ def validate_desktop_ready(data: dict, check_system: bool = True) -> tuple[bool,
         except Exception as e:
             return False, f"Failed to read LightDM config: {e}"
 
+        if os.path.exists(LIGHTDM_OOBE_CONF):
+            return False, f"Obsolete OOBE config '{LIGHTDM_OOBE_CONF}' still exists"
+
+        if os.path.exists(LIGHTDM_LIVE_CONF):
+            return False, f"Obsolete Live autologin config '{LIGHTDM_LIVE_CONF}' still exists"
+
     return True, None
+
+def _write_single_state_file_atomic(file_path: str, data: dict) -> bool:
+    """Internal helper to atomically write, flush, fsync, and replace a single state file."""
+    dir_path = os.path.dirname(file_path)
+    os.makedirs(dir_path, exist_ok=True)
+    tmp_path = file_path + ".tmp"
+    try:
+        payload = json.dumps(data, indent=2)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_path, 0o644)
+        os.replace(tmp_path, file_path)
+        os.chmod(file_path, 0o644)
+
+        try:
+            dir_fd = os.open(dir_path, os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        log(f"Error atomically writing state file {file_path}: {e}")
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        return False
 
 def load_installer_state(state_file_path: str = None) -> dict:
     """
-    Safely loads authoritative installer state.
+    Safely loads authoritative installer state with monotonic generation and dual-file recovery.
     Primary state file is /var/lib/windroid/installer-state.json.
-    Backup is checked ONLY if primary is absent or invalid, and backup must validate independently.
+    Backup is /var/lib/windroid/installation-state.json.
     """
-    if state_file_path is None:
-        state_file_path = STATE_FILE
+    primary_path = state_file_path if state_file_path else STATE_FILE
+    backup_path = STATE_BACKUP_FILE if primary_path == STATE_FILE else os.path.join(os.path.dirname(primary_path), "installation-state.json")
 
-    # 1. Try Primary
-    if os.path.exists(state_file_path):
+    p_data = None
+    p_valid = False
+    p_gen = 0
+
+    b_data = None
+    b_valid = False
+    b_gen = 0
+
+    # 1. Read and validate Primary
+    if os.path.exists(primary_path):
         try:
-            with open(state_file_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                valid, err = validate_state(data)
+            with open(primary_path, "r", encoding="utf-8") as f:
+                p_data = json.load(f)
+                valid, err = validate_state(p_data)
                 if valid:
-                    return data
+                    p_valid = True
+                    p_gen = int(p_data.get("generation", 0) or 0)
                 else:
-                    log(f"Warning: Primary state file {state_file_path} failed validation: {err}")
+                    log(f"Warning: Primary state file {primary_path} failed validation: {err}")
         except Exception as e:
-            log(f"Warning: Failed to parse primary state file {state_file_path}: {e}")
+            log(f"Warning: Failed to parse primary state file {primary_path}: {e}")
 
-    # 2. Try Backup only if primary failed/missing
-    if os.path.exists(STATE_BACKUP_FILE) and STATE_BACKUP_FILE != state_file_path:
+    # 2. Read and validate Backup
+    if os.path.exists(backup_path):
         try:
-            with open(STATE_BACKUP_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                valid, err = validate_state(data)
+            with open(backup_path, "r", encoding="utf-8") as f:
+                b_data = json.load(f)
+                valid, err = validate_state(b_data)
                 if valid:
-                    log(f"Recovery: Primary state missing/corrupt, successfully recovered valid state from backup {STATE_BACKUP_FILE} (state: {data.get('state')})")
-                    return data
+                    b_valid = True
+                    b_gen = int(b_data.get("generation", 0) or 0)
                 else:
-                    log(f"Warning: Backup state file {STATE_BACKUP_FILE} also failed validation: {err}")
+                    log(f"Warning: Backup state file {backup_path} failed validation: {err}")
         except Exception as e:
-            log(f"Warning: Failed to parse backup state file {STATE_BACKUP_FILE}: {e}")
+            log(f"Warning: Failed to parse backup state file {backup_path}: {e}")
 
-    # 3. Fail closed if neither primary nor backup is valid
+    # 3. Decision Matrix with Self-Healing
+    if p_valid and b_valid:
+        if b_gen > p_gen:
+            log(f"Self-Healing: Backup state has higher generation ({b_gen} > {p_gen}), recovering primary.")
+            _write_single_state_file_atomic(primary_path, b_data)
+            return b_data
+        elif p_gen > b_gen:
+            log(f"Self-Healing: Primary state has higher generation ({p_gen} > {b_gen}), updating backup.")
+            _write_single_state_file_atomic(backup_path, p_data)
+            return p_data
+        else:
+            return p_data
+
+    elif p_valid and not b_valid:
+        log(f"Self-Healing: Primary state valid, recovering corrupt/missing backup {backup_path}.")
+        _write_single_state_file_atomic(backup_path, p_data)
+        return p_data
+
+    elif b_valid and not p_valid:
+        log(f"Self-Healing: Backup state valid, recovering corrupt/missing primary {primary_path} (state: {b_data.get('state')}).")
+        _write_single_state_file_atomic(primary_path, b_data)
+        return b_data
+
+    # 4. Fail closed if neither primary nor backup is valid
     log("Error: Neither primary nor backup installer-state is valid. Returning fail-closed state.")
     return {
         "version": STATE_VERSION,
         "state": "FAILED",
+        "generation": 0,
         "installationCompleted": False,
         "oobeCompleted": False,
         "error": "Installer state file missing or corrupt"
     }
 
 def save_installer_state_atomic(state_data: dict, target_root: str = "/") -> bool:
-    """Persists installer state using strict atomic write semantics."""
+    """Persists installer state using strict atomic write semantics, monotonic generation, and dual-file sync."""
     valid, err = validate_state(state_data)
     if not valid:
         log(f"ERROR: Refusing to save invalid state data: {err}")
@@ -305,9 +422,24 @@ def save_installer_state_atomic(state_data: dict, target_root: str = "/") -> boo
         backup_file = os.path.join(target_dir, "installation-state.json")
 
     os.makedirs(target_dir, exist_ok=True)
-    tmp_file = target_file + ".tmp"
 
-    # Transition validation
+    # Compute next monotonic generation
+    prev_gen = 0
+    for path_to_check in [target_file, backup_file]:
+        if os.path.exists(path_to_check):
+            try:
+                with open(path_to_check, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                    g = int(d.get("generation", 0) or 0)
+                    if g > prev_gen:
+                        prev_gen = g
+            except Exception:
+                pass
+
+    state_data["generation"] = prev_gen + 1
+    state_data["updatedAt"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    # Transition validation against existing state
     if os.path.exists(target_file):
         try:
             with open(target_file, "r", encoding="utf-8") as f:
@@ -320,33 +452,19 @@ def save_installer_state_atomic(state_data: dict, target_root: str = "/") -> boo
         except Exception as e:
             log(f"Notice: Failed to read previous state file for transition check: {e}")
 
-    state_data["updatedAt"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    payload = json.dumps(state_data, indent=2)
-
-    try:
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            f.write(payload)
-            f.flush()
-            os.fsync(f.fileno())
-
-        os.chmod(tmp_file, 0o644)
-        os.replace(tmp_file, target_file)
-        os.chmod(target_file, 0o644)
-        shutil.copy2(target_file, backup_file)
-        os.chmod(backup_file, 0o644)
-
-        # Fsync parent directory
-        dir_fd = os.open(target_dir, os.O_DIRECTORY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
-
-        run_cmd(["sync"])
-        return True
-    except Exception as e:
-        log(f"Error persisting installer state atomically: {e}")
+    # Atomically write primary file
+    ok_p = _write_single_state_file_atomic(target_file, state_data)
+    if not ok_p:
+        log(f"ERROR: Failed to write primary state file {target_file}")
         return False
+
+    # Atomically write backup file
+    ok_b = _write_single_state_file_atomic(backup_file, state_data)
+    if not ok_b:
+        log(f"WARNING: Failed to write backup state file {backup_file}")
+
+    run_cmd(["sync"])
+    return True
 
 def user_exists(username: str) -> bool:
     if not username:

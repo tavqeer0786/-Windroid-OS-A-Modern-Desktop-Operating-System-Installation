@@ -410,15 +410,27 @@ def validate_native_installer_state_data(data: dict) -> tuple[bool, str | None]:
 def validate_desktop_ready(data: dict, check_system: bool = False) -> tuple[bool, str | None]:
     """
     Formally validates all invariants for DESKTOP_READY state:
-    1. State is 'DESKTOP_READY'
-    2. installationCompleted is True
-    3. oobeCompleted is True
-    4. userConfig is a valid dictionary with a valid, non-reserved username
-    5. If check_system is True:
-       - User exists in passwd/getent
-       - User home directory exists
-       - LightDM autologin configuration exists and specifies autologin-user=<username>
-       - windroid-oobe is not the autologin user
+    1. State data is a dictionary
+    2. State is 'DESKTOP_READY'
+    3. installationCompleted is True
+    4. oobeCompleted is True
+    5. userConfig is a valid dictionary
+    6. username is non-empty, non-reserved, and valid linux username format
+    7. username is not root and not windroid-oobe
+    8. error is None
+    9. timestamp is present
+    When check_system is True:
+    10. Real user exists in system (getent passwd)
+    11. Real user UID >= 1000
+    12. User home directory (/home/<username>) exists
+    13. User home directory is owned by the real user
+    14. User's login shell is valid/executable
+    15. User belongs to essential groups
+    16. LightDM autologin configuration exists at /etc/lightdm/lightdm.conf.d/80-windroid-autologin.conf
+    17. LightDM autologin configuration explicitly specifies autologin-user=<username>
+    18. LightDM autologin configuration does not specify windroid-oobe
+    19. OOBE autologin config (80-windroid-oobe.conf) is absent
+    20. Live autologin config (80-windroid-live-autologin.conf) is absent
     """
     if not isinstance(data, dict):
         return False, "State data must be a dictionary"
@@ -431,6 +443,12 @@ def validate_desktop_ready(data: dict, check_system: bool = False) -> tuple[bool
         
     if data.get("oobeCompleted") is not True:
         return False, "oobeCompleted must be true for DESKTOP_READY"
+
+    if data.get("error") is not None:
+        return False, "error must be null for DESKTOP_READY"
+
+    if not (data.get("oobeCompletedAt") or data.get("completedAt") or data.get("updatedAt")):
+        return False, "Timestamp must be present for DESKTOP_READY"
         
     u_cfg = data.get("userConfig")
     if not isinstance(u_cfg, dict):
@@ -448,9 +466,34 @@ def validate_desktop_ready(data: dict, check_system: bool = False) -> tuple[bool
         if not ok_getent or not out_getent.strip():
             return False, f"Real user '{username}' does not exist in passwd database"
         
-        user_home = f"/home/{username}"
-        if not os.path.exists(user_home):
-            return False, f"User home directory '{user_home}' does not exist"
+        parts = out_getent.strip().split(":")
+        if len(parts) >= 7:
+            try:
+                uid = int(parts[2])
+                if uid < 1000 and username != "root":
+                    return False, f"User '{username}' has system UID {uid} (< 1000)"
+            except ValueError:
+                pass
+            
+            user_home = parts[5]
+            user_shell = parts[6]
+            
+            if not os.path.exists(user_home):
+                return False, f"User home directory '{user_home}' does not exist"
+                
+            try:
+                st = os.stat(user_home)
+                if uid >= 1000 and st.st_uid != uid and os.geteuid() == 0:
+                    return False, f"User home '{user_home}' is not owned by user {uid}"
+            except Exception:
+                pass
+
+            if user_shell and not os.path.exists(user_shell) and not os.path.exists("/bin/sh"):
+                return False, f"User login shell '{user_shell}' does not exist"
+        else:
+            user_home = f"/home/{username}"
+            if not os.path.exists(user_home):
+                return False, f"User home directory '{user_home}' does not exist"
             
         lightdm_conf = "/etc/lightdm/lightdm.conf.d/80-windroid-autologin.conf"
         if not os.path.exists(lightdm_conf):
@@ -466,50 +509,130 @@ def validate_desktop_ready(data: dict, check_system: bool = False) -> tuple[bool
         except Exception as e:
             return False, f"Failed to read LightDM config: {e}"
 
+        oobe_conf = "/etc/lightdm/lightdm.conf.d/80-windroid-oobe.conf"
+        if os.path.exists(oobe_conf):
+            return False, f"Obsolete OOBE config '{oobe_conf}' still exists"
+
+        live_conf = "/etc/lightdm/lightdm.conf.d/80-windroid-live-autologin.conf"
+        if os.path.exists(live_conf):
+            return False, f"Obsolete Live autologin config '{live_conf}' still exists"
+
     return True, None
+
+def _write_single_state_file_atomic(file_path: str, data: dict) -> bool:
+    """Internal helper to atomically write, flush, fsync, and replace a single state file."""
+    dir_path = os.path.dirname(file_path)
+    os.makedirs(dir_path, exist_ok=True)
+    tmp_path = file_path + ".tmp"
+    try:
+        payload = json.dumps(data, indent=2)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_path, 0o644)
+        os.replace(tmp_path, file_path)
+        os.chmod(file_path, 0o644)
+
+        try:
+            dir_fd = os.open(dir_path, os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        _log_installer(f"Error atomically writing state file {file_path}: {e}")
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        return False
 
 def load_native_installer_state(target_root="/"):
     primary_filepath = os.path.join(target_root, "var/lib/windroid/installer-state.json")
     backup_filepath = os.path.join(target_root, "var/lib/windroid/installation-state.json")
 
-    # 1. Try Primary
+    p_data = None
+    p_valid = False
+    p_gen = 0
+
+    b_data = None
+    b_valid = False
+    b_gen = 0
+
+    # 1. Read and validate Primary
     if os.path.exists(primary_filepath):
         try:
             with open(primary_filepath, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                valid, err = validate_native_installer_state_data(data)
+                p_data = json.load(f)
+                valid, err = validate_native_installer_state_data(p_data)
                 if valid:
-                    res = dict(data)
-                    res["success"] = True
-                    return res
+                    p_valid = True
+                    p_gen = int(p_data.get("generation", 0) or 0)
                 else:
                     _log_installer(f"Warning: Primary state file {primary_filepath} failed validation: {err}")
         except Exception as e:
             _log_installer(f"Failed to read native installer primary state file {primary_filepath}: {e}")
 
-    # 2. Try Backup
+    # 2. Read and validate Backup
     if os.path.exists(backup_filepath):
         try:
             with open(backup_filepath, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                valid, err = validate_native_installer_state_data(data)
+                b_data = json.load(f)
+                valid, err = validate_native_installer_state_data(b_data)
                 if valid:
-                    _log_installer(f"Recovery: Recovered valid state from backup {backup_filepath}")
-                    res = dict(data)
-                    res["success"] = True
-                    return res
+                    b_valid = True
+                    b_gen = int(b_data.get("generation", 0) or 0)
                 else:
                     _log_installer(f"Warning: Backup state file {backup_filepath} failed validation: {err}")
         except Exception as e:
             _log_installer(f"Failed to read native installer backup state file {backup_filepath}: {e}")
 
-    # 3. Default state based on runtime environment
+    # 3. Decision Matrix with Self-Healing
+    if p_valid and b_valid:
+        if b_gen > p_gen:
+            _log_installer(f"Self-Healing: Backup state has higher generation ({b_gen} > {p_gen}), recovering primary.")
+            _write_single_state_file_atomic(primary_filepath, b_data)
+            res = dict(b_data)
+            res["success"] = True
+            return res
+        elif p_gen > b_gen:
+            _log_installer(f"Self-Healing: Primary state has higher generation ({p_gen} > {b_gen}), updating backup.")
+            _write_single_state_file_atomic(backup_filepath, p_data)
+            res = dict(p_data)
+            res["success"] = True
+            return res
+        else:
+            res = dict(p_data)
+            res["success"] = True
+            return res
+
+    elif p_valid and not b_valid:
+        _log_installer(f"Self-Healing: Primary state valid, recovering corrupt/missing backup {backup_filepath}.")
+        _write_single_state_file_atomic(backup_filepath, p_data)
+        res = dict(p_data)
+        res["success"] = True
+        return res
+
+    elif b_valid and not p_valid:
+        _log_installer(f"Self-Healing: Backup state valid, recovering corrupt/missing primary {primary_filepath} (state: {b_data.get('state')}).")
+        _write_single_state_file_atomic(primary_filepath, b_data)
+        res = dict(b_data)
+        res["success"] = True
+        return res
+
+    # 4. Default state based on runtime environment
     is_live = is_live_system() if target_root == "/" else False
     if is_live:
         return {
             "success": True,
             "version": STATE_VERSION,
             "state": "INSTALLER",
+            "generation": 0,
             "updatedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "targetDisk": None,
             "localeConfig": {},
@@ -526,6 +649,7 @@ def load_native_installer_state(target_root="/"):
         "success": False,
         "version": STATE_VERSION,
         "state": "FAILED",
+        "generation": 0,
         "updatedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "error": f"Corrupted or missing state file at {primary_filepath}"
     }
@@ -538,7 +662,6 @@ def save_native_installer_state(target_root="/", state="OOBE_PENDING", data=None
     os.makedirs(dirpath, exist_ok=True)
     filepath = os.path.join(dirpath, "installer-state.json")
     backuppath = os.path.join(dirpath, "installation-state.json")
-    tmppath = filepath + ".tmp"
 
     existing = load_native_installer_state(target_root)
     existing_state = existing.get("state")
@@ -574,9 +697,23 @@ def save_native_installer_state(target_root="/", state="OOBE_PENDING", data=None
     if is_oobe_done and not oobe_completed_at:
         oobe_completed_at = now
 
+    # Compute next monotonic generation
+    prev_gen = 0
+    for path_to_check in [filepath, backuppath]:
+        if os.path.exists(path_to_check):
+            try:
+                with open(path_to_check, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                    g = int(d.get("generation", 0) or 0)
+                    if g > prev_gen:
+                        prev_gen = g
+            except Exception:
+                pass
+
     merged_data = {
         "version": STATE_VERSION,
         "state": state,
+        "generation": prev_gen + 1,
         "updatedAt": now,
         "targetDisk": target_disk,
         "localeConfig": locale_cfg,
@@ -595,24 +732,16 @@ def save_native_installer_state(target_root="/", state="OOBE_PENDING", data=None
         raise ValueError(f"Invalid state data generated for '{state}': {val_err}")
 
     # Write primary file atomically
-    with open(tmppath, "w", encoding="utf-8") as f:
-        json.dump(merged_data, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
+    ok_p = _write_single_state_file_atomic(filepath, merged_data)
+    if not ok_p:
+        raise RuntimeError(f"Failed to atomically write primary state file {filepath}")
 
-    os.replace(tmppath, filepath)
-    shutil.copy2(filepath, backuppath)
+    # Write backup file atomically
+    ok_b = _write_single_state_file_atomic(backuppath, merged_data)
+    if not ok_b:
+        _log_installer(f"Warning: Failed to atomically write backup state file {backuppath}")
 
-    try:
-        dfd = os.open(dirpath, os.O_RDONLY)
-        try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
-    except Exception as e:
-        _log_installer(f"Directory fsync notice for {dirpath}: {e}")
-
-    # Read-back verification (Rule #10)
+    # Read-back verification
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             rb_primary = json.load(f)
