@@ -183,12 +183,74 @@ def validate_state(data: dict) -> tuple[bool, str | None]:
 
     return True, None
 
-def load_installer_state(state_file_path: str = STATE_FILE) -> dict:
+def validate_desktop_ready(data: dict, check_system: bool = True) -> tuple[bool, str | None]:
+    """
+    Formally validates all invariants for DESKTOP_READY state:
+    1. State is 'DESKTOP_READY'
+    2. installationCompleted is True
+    3. oobeCompleted is True
+    4. userConfig is a valid dictionary with a valid, non-reserved username
+    5. If check_system is True:
+       - Real user exists in getent passwd
+       - User home directory exists
+       - LightDM autologin configuration exists and specifies autologin-user=<username>
+       - windroid-oobe is not the autologin user
+    """
+    if not isinstance(data, dict):
+        return False, "State data must be a dictionary"
+    
+    if data.get("state") != "DESKTOP_READY":
+        return False, f"Expected state 'DESKTOP_READY', got '{data.get('state')}'"
+    
+    if data.get("installationCompleted") is not True:
+        return False, "installationCompleted must be true for DESKTOP_READY"
+        
+    if data.get("oobeCompleted") is not True:
+        return False, "oobeCompleted must be true for DESKTOP_READY"
+        
+    u_cfg = data.get("userConfig")
+    if not isinstance(u_cfg, dict):
+        return False, "userConfig must be a valid dictionary"
+        
+    username = str(u_cfg.get("username", "")).strip()
+    if not username or username == OOBE_USER or username in RESERVED_SYSTEM_USERNAMES:
+        return False, f"Invalid or reserved username '{username}'"
+        
+    if not re.match(r'^[a-z_][a-z0-9_-]*$', username):
+        return False, f"Username '{username}' contains invalid characters"
+
+    if check_system:
+        if not user_exists(username):
+            return False, f"Real user '{username}' does not exist in passwd database"
+        
+        user_home = f"/home/{username}"
+        if not os.path.exists(user_home):
+            return False, f"User home directory '{user_home}' does not exist"
+            
+        if not os.path.exists(LIGHTDM_AUTOLOGIN_CONF):
+            return False, f"LightDM autologin config '{LIGHTDM_AUTOLOGIN_CONF}' does not exist"
+            
+        try:
+            with open(LIGHTDM_AUTOLOGIN_CONF, "r", encoding="utf-8") as f:
+                content = f.read()
+                if f"autologin-user={username}" not in content:
+                    return False, f"LightDM autologin is not set to '{username}'"
+                if f"autologin-user={OOBE_USER}" in content:
+                    return False, f"LightDM autologin still contains temporary user '{OOBE_USER}'"
+        except Exception as e:
+            return False, f"Failed to read LightDM config: {e}"
+
+    return True, None
+
+def load_installer_state(state_file_path: str = None) -> dict:
     """
     Safely loads authoritative installer state.
     Primary state file is /var/lib/windroid/installer-state.json.
     Backup is checked ONLY if primary is absent or invalid, and backup must validate independently.
     """
+    if state_file_path is None:
+        state_file_path = STATE_FILE
+
     # 1. Try Primary
     if os.path.exists(state_file_path):
         try:
@@ -233,11 +295,17 @@ def save_installer_state_atomic(state_data: dict, target_root: str = "/") -> boo
         log(f"ERROR: Refusing to save invalid state data: {err}")
         return False
 
-    target_dir = os.path.join(target_root, "var/lib/windroid")
+    if target_root == "/":
+        target_file = STATE_FILE
+        backup_file = STATE_BACKUP_FILE
+        target_dir = os.path.dirname(target_file)
+    else:
+        target_dir = os.path.join(target_root, "var/lib/windroid")
+        target_file = os.path.join(target_dir, "installer-state.json")
+        backup_file = os.path.join(target_dir, "installation-state.json")
+
     os.makedirs(target_dir, exist_ok=True)
-    target_file = os.path.join(target_dir, "installer-state.json")
-    backup_file = os.path.join(target_dir, "installation-state.json")
-    tmp_file = os.path.join(target_dir, "installer-state.json.tmp")
+    tmp_file = target_file + ".tmp"
 
     # Transition validation
     if os.path.exists(target_file):

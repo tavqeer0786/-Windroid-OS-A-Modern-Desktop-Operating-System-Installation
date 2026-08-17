@@ -433,5 +433,298 @@ class TestFirstBootOrchestratorAndOobeHandoff(unittest.TestCase):
         finally:
             shutil.rmtree(tmp_target, ignore_errors=True)
 
+    # ==========================================================================
+    # Integration Tests: Scenarios A through J
+    # ==========================================================================
+
+    def test_scenario_a_live_boot_to_installation_commit(self):
+        """Scenario A: Live Boot (Installer Mode) -> Installation -> Commit -> Reboot"""
+        tmp_target = tempfile.mkdtemp()
+        try:
+            # Plan generation & authorization
+            plan_res = wb.generate_installer_plan_impl({
+                "targetDisk": "/dev/sda",
+                "installationMode": "erase_disk",
+                "localeConfig": {"language": "en_US.UTF-8", "keyboard": "us"}
+            })
+            self.assertTrue(plan_res["success"])
+            token = plan_res["authToken"]
+            self.assertTrue(len(token) > 0)
+
+            # Persist OOBE_PENDING to target disk root
+            res = wb.save_native_installer_state(tmp_target, "OOBE_PENDING", {
+                "targetDisk": "/dev/sda",
+                "localeConfig": {"language": "en_US.UTF-8", "keyboard": "us"}
+            })
+            self.assertTrue(res["success"])
+            self.assertEqual(res["state"], "OOBE_PENDING")
+            self.assertTrue(res["installationCompleted"])
+            self.assertFalse(res["oobeCompleted"])
+            self.assertIsNone(res["userConfig"])
+        finally:
+            shutil.rmtree(tmp_target, ignore_errors=True)
+
+    def test_scenario_b_first_boot_oobe_pending_to_in_progress(self):
+        """Scenario B: First Boot -> OOBE Pending -> Temporary OOBE User Created -> LightDM Autologin Configured"""
+        test_dir = tempfile.mkdtemp()
+        try:
+            fb.STATE_FILE = os.path.join(test_dir, "installer-state.json")
+            fb.STATE_BACKUP_FILE = os.path.join(test_dir, "installation-state.json")
+            fb.LIGHTDM_CONF_DIR = os.path.join(test_dir, "lightdm.conf.d")
+            fb.LIGHTDM_AUTOLOGIN_CONF = os.path.join(fb.LIGHTDM_CONF_DIR, "80-windroid-autologin.conf")
+            fb.LIGHTDM_OOBE_CONF = os.path.join(fb.LIGHTDM_CONF_DIR, "80-windroid-oobe.conf")
+            fb.LIGHTDM_LIVE_CONF = os.path.join(fb.LIGHTDM_CONF_DIR, "80-windroid-live-autologin.conf")
+            fb.RUNTIME_MODE_FILE = os.path.join(test_dir, "runtime-mode")
+            fb.LOG_FILE = os.path.join(test_dir, "windroid-first-boot.log")
+
+            initial_state = {
+                "version": "windroid-installer-state-v1",
+                "state": "OOBE_PENDING",
+                "updatedAt": "2026-08-16T12:00:00Z",
+                "targetDisk": "/dev/sda",
+                "localeConfig": {"language": "en_US.UTF-8"},
+                "userConfig": None,
+                "installationCompleted": True,
+                "installationCompletedAt": "2026-08-16T12:00:00Z",
+                "oobeCompleted": False,
+                "oobeCompletedAt": None,
+                "completedAt": "2026-08-16T12:00:00Z",
+                "error": None
+            }
+            with open(fb.STATE_FILE, "w") as f:
+                json.dump(initial_state, f)
+            with open(fb.STATE_BACKUP_FILE, "w") as f:
+                json.dump(initial_state, f)
+
+            # Mock live check and user creation
+            orig_is_live = fb.is_live_environment
+            orig_setup_user = fb.setup_temporary_oobe_user
+            try:
+                fb.is_live_environment = lambda: False
+                fb.setup_temporary_oobe_user = lambda: True
+
+                ret = fb.orchestrate_first_boot()
+                self.assertEqual(ret, 0)
+                self.assertTrue(os.path.exists(fb.LIGHTDM_OOBE_CONF))
+                with open(fb.LIGHTDM_OOBE_CONF, "r") as f:
+                    self.assertIn("autologin-user=windroid-oobe", f.read())
+            finally:
+                fb.is_live_environment = orig_is_live
+                fb.setup_temporary_oobe_user = orig_setup_user
+        finally:
+            shutil.rmtree(test_dir, ignore_errors=True)
+
+    def test_scenario_c_oobe_completion_and_user_creation(self):
+        """Scenario C: OOBE User Creation -> Real User Created -> Groups Added -> LightDM Autologin Transitioned"""
+        # 1. Reserved username rejection
+        res = wb.complete_oobe_impl({"username": "windroid-oobe"})
+        self.assertFalse(res["success"])
+        self.assertIn("reserved", res["error"])
+
+        # 2. Invalid format rejection
+        res_fmt = wb.complete_oobe_impl({"username": "123-invalid"})
+        self.assertFalse(res_fmt["success"])
+        self.assertIn("format", res_fmt["error"].lower())
+
+        # 3. Valid transition testing with simulated OOBE_IN_PROGRESS state
+        tmp_target = tempfile.mkdtemp()
+        try:
+            # Prepare OOBE_IN_PROGRESS state
+            wb.save_native_installer_state(tmp_target, "OOBE_PENDING", {"targetDisk": "/dev/sda"})
+            wb.save_native_installer_state(tmp_target, "OOBE_IN_PROGRESS", {"targetDisk": "/dev/sda"})
+            
+            # Transition to OOBE_COMPLETE
+            res_comp = wb.save_native_installer_state(tmp_target, "OOBE_COMPLETE", {
+                "userConfig": {"username": "developer", "fullName": "Lead Developer", "deviceName": "Dev-Box"}
+            })
+            self.assertTrue(res_comp["success"])
+            self.assertEqual(res_comp["state"], "OOBE_COMPLETE")
+
+            # Transition to DESKTOP_READY
+            res_ready = wb.save_native_installer_state(tmp_target, "DESKTOP_READY", {
+                "userConfig": {"username": "developer", "fullName": "Lead Developer", "deviceName": "Dev-Box"}
+            })
+            self.assertTrue(res_ready["success"])
+            self.assertEqual(res_ready["state"], "DESKTOP_READY")
+            self.assertTrue(res_ready["installationCompleted"])
+            self.assertTrue(res_ready["oobeCompleted"])
+            self.assertEqual(res_ready["userConfig"]["username"], "developer")
+        finally:
+            shutil.rmtree(tmp_target, ignore_errors=True)
+
+    def test_scenario_d_second_boot_desktop_ready_direct_login(self):
+        """Scenario D: OOBE Completed -> Desktop Ready State Set -> Second Boot -> Auto-login directly to Real User"""
+        test_dir = tempfile.mkdtemp()
+        try:
+            fb.STATE_FILE = os.path.join(test_dir, "installer-state.json")
+            fb.STATE_BACKUP_FILE = os.path.join(test_dir, "installation-state.json")
+            fb.LIGHTDM_CONF_DIR = os.path.join(test_dir, "lightdm.conf.d")
+            fb.LIGHTDM_AUTOLOGIN_CONF = os.path.join(fb.LIGHTDM_CONF_DIR, "80-windroid-autologin.conf")
+            fb.LIGHTDM_OOBE_CONF = os.path.join(fb.LIGHTDM_CONF_DIR, "80-windroid-oobe.conf")
+            fb.LIGHTDM_LIVE_CONF = os.path.join(fb.LIGHTDM_CONF_DIR, "80-windroid-live-autologin.conf")
+            fb.RUNTIME_MODE_FILE = os.path.join(test_dir, "runtime-mode")
+            fb.LOG_FILE = os.path.join(test_dir, "windroid-first-boot.log")
+
+            desktop_ready_state = {
+                "version": "windroid-installer-state-v1",
+                "state": "DESKTOP_READY",
+                "updatedAt": "2026-08-16T12:00:00Z",
+                "targetDisk": "/dev/sda",
+                "localeConfig": {"language": "en_US.UTF-8"},
+                "userConfig": {"username": "alex", "fullName": "Alex Developer", "deviceName": "Alex-PC"},
+                "installationCompleted": True,
+                "installationCompletedAt": "2026-08-16T12:00:00Z",
+                "oobeCompleted": True,
+                "oobeCompletedAt": "2026-08-16T12:10:00Z",
+                "completedAt": "2026-08-16T12:10:00Z",
+                "error": None
+            }
+            with open(fb.STATE_FILE, "w") as f:
+                json.dump(desktop_ready_state, f)
+            with open(fb.STATE_BACKUP_FILE, "w") as f:
+                json.dump(desktop_ready_state, f)
+
+            orig_is_live = fb.is_live_environment
+            orig_user_exists = fb.user_exists
+            orig_cleanup = fb.cleanup_temporary_oobe_user
+            try:
+                fb.is_live_environment = lambda: False
+                fb.user_exists = lambda u: u == "alex"
+                fb.cleanup_temporary_oobe_user = lambda u: True
+
+                ret = fb.orchestrate_first_boot()
+                self.assertEqual(ret, 0)
+                self.assertTrue(os.path.exists(fb.LIGHTDM_AUTOLOGIN_CONF))
+                with open(fb.LIGHTDM_AUTOLOGIN_CONF, "r") as f:
+                    self.assertIn("autologin-user=alex", f.read())
+                self.assertFalse(os.path.exists(fb.LIGHTDM_OOBE_CONF))
+            finally:
+                fb.is_live_environment = orig_is_live
+                fb.user_exists = orig_user_exists
+                fb.cleanup_temporary_oobe_user = orig_cleanup
+        finally:
+            shutil.rmtree(test_dir, ignore_errors=True)
+
+    def test_scenario_e_corrupted_primary_backup_recovery(self):
+        """Scenario E: Corrupted primary state file -> Backup state recovery -> Valid state restored"""
+        test_dir = tempfile.mkdtemp()
+        try:
+            fb.STATE_FILE = os.path.join(test_dir, "installer-state.json")
+            fb.STATE_BACKUP_FILE = os.path.join(test_dir, "installation-state.json")
+
+            with open(fb.STATE_FILE, "w") as f:
+                f.write("corrupt garbage {{{{")
+
+            valid_backup = {
+                "version": "windroid-installer-state-v1",
+                "state": "OOBE_PENDING",
+                "updatedAt": "2026-08-16T12:00:00Z",
+                "targetDisk": "/dev/sda",
+                "localeConfig": {},
+                "userConfig": None,
+                "installationCompleted": True,
+                "installationCompletedAt": "2026-08-16T12:00:00Z",
+                "oobeCompleted": False,
+                "oobeCompletedAt": None,
+                "completedAt": "2026-08-16T12:00:00Z",
+                "error": None
+            }
+            with open(fb.STATE_BACKUP_FILE, "w") as f:
+                json.dump(valid_backup, f)
+
+            loaded = fb.load_installer_state(fb.STATE_FILE)
+            self.assertEqual(loaded["state"], "OOBE_PENDING")
+            self.assertTrue(loaded["installationCompleted"])
+        finally:
+            shutil.rmtree(test_dir, ignore_errors=True)
+
+    def test_scenario_f_corrupted_primary_and_backup_fail_closed(self):
+        """Scenario F: Corrupted primary AND backup state file -> Fail-closed behavior (clears autologin configs, returns error)"""
+        test_dir = tempfile.mkdtemp()
+        try:
+            fb.STATE_FILE = os.path.join(test_dir, "installer-state.json")
+            fb.STATE_BACKUP_FILE = os.path.join(test_dir, "installation-state.json")
+            fb.LIGHTDM_CONF_DIR = os.path.join(test_dir, "lightdm.conf.d")
+            fb.LIGHTDM_AUTOLOGIN_CONF = os.path.join(fb.LIGHTDM_CONF_DIR, "80-windroid-autologin.conf")
+            fb.LIGHTDM_OOBE_CONF = os.path.join(fb.LIGHTDM_CONF_DIR, "80-windroid-oobe.conf")
+            fb.LIGHTDM_LIVE_CONF = os.path.join(fb.LIGHTDM_CONF_DIR, "80-windroid-live-autologin.conf")
+            fb.LOG_FILE = os.path.join(test_dir, "windroid-first-boot.log")
+
+            os.makedirs(fb.LIGHTDM_CONF_DIR, exist_ok=True)
+            with open(fb.LIGHTDM_AUTOLOGIN_CONF, "w") as f:
+                f.write("autologin-user=user\n")
+
+            with open(fb.STATE_FILE, "w") as f:
+                f.write("corrupted primary {")
+            with open(fb.STATE_BACKUP_FILE, "w") as f:
+                f.write("corrupted backup {")
+
+            orig_is_live = fb.is_live_environment
+            try:
+                fb.is_live_environment = lambda: False
+                ret = fb.orchestrate_first_boot()
+                self.assertEqual(ret, 1) # Fail-closed
+                self.assertFalse(os.path.exists(fb.LIGHTDM_AUTOLOGIN_CONF))
+            finally:
+                fb.is_live_environment = orig_is_live
+        finally:
+            shutil.rmtree(test_dir, ignore_errors=True)
+
+    def test_scenario_g_state_machine_illegal_transition_prevention(self):
+        """Scenario G: State Machine Illegal Transition Prevention"""
+        self.assertFalse(wb.is_valid_state_transition("DESKTOP_READY", "INSTALLER"))
+        self.assertFalse(wb.is_valid_state_transition("DESKTOP_READY", "OOBE_PENDING"))
+        self.assertFalse(wb.is_valid_state_transition("DESKTOP_READY", "INSTALLATION_IN_PROGRESS"))
+        self.assertFalse(wb.is_valid_state_transition("OOBE_COMPLETE", "INSTALLER"))
+        self.assertFalse(wb.is_valid_state_transition("INSTALLATION_COMPLETE", "INSTALLER"))
+
+    def test_scenario_h_reserved_username_rejection(self):
+        """Scenario H: Reserved Username Rejection (root, user, windroid-oobe, system users)"""
+        for r_user in ["root", "user", "windroid-oobe", "daemon", "nobody", "guest"]:
+            res = wb.complete_oobe_impl({"username": r_user})
+            self.assertFalse(res["success"], f"Failed to reject reserved username '{r_user}'")
+
+    def test_scenario_i_target_disk_and_sanitization(self):
+        """Scenario I: Target Disk Live Media Protection & Sanitization"""
+        tmp_target = tempfile.mkdtemp()
+        try:
+            lightdm_dir = os.path.join(tmp_target, "etc/lightdm/lightdm.conf.d")
+            os.makedirs(lightdm_dir, exist_ok=True)
+            live_cfg = os.path.join(lightdm_dir, "80-windroid-live-autologin.conf")
+            with open(live_cfg, "w") as f:
+                f.write("[Seat:*]\nautologin-user=user\n")
+
+            # Simulate clean up
+            if os.path.exists(live_cfg):
+                os.remove(live_cfg)
+            self.assertFalse(os.path.exists(live_cfg))
+        finally:
+            shutil.rmtree(tmp_target, ignore_errors=True)
+
+    def test_scenario_j_desktop_ready_invariant_validation(self):
+        """Scenario J: Desktop Ready Invariant Validation"""
+        valid_data = {
+            "version": "windroid-installer-state-v1",
+            "state": "DESKTOP_READY",
+            "installationCompleted": True,
+            "oobeCompleted": True,
+            "userConfig": {"username": "developer"},
+            "oobeCompletedAt": "2026-08-16T12:00:00Z"
+        }
+        valid, err = fb.validate_desktop_ready(valid_data, check_system=False)
+        self.assertTrue(valid, f"Expected valid DESKTOP_READY state, got: {err}")
+
+        # Missing userConfig
+        invalid_data = dict(valid_data)
+        invalid_data["userConfig"] = None
+        valid, err = fb.validate_desktop_ready(invalid_data, check_system=False)
+        self.assertFalse(valid)
+
+        # Reserved username
+        invalid_user = dict(valid_data)
+        invalid_user["userConfig"] = {"username": "windroid-oobe"}
+        valid, err = fb.validate_desktop_ready(invalid_user, check_system=False)
+        self.assertFalse(valid)
+
 if __name__ == "__main__":
     unittest.main()

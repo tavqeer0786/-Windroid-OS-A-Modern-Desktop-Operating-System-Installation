@@ -12,8 +12,18 @@ BRIDGE_LOG="/tmp/windroid-bridge.log"
 
 echo "[Windroid OS] Initializing Desktop Shell Watchdog at $(date)" > "$SHELL_LOG"
 
+# ------------------------------------------------------------------------------
+# Single-Instance Lock & Guard
+# ------------------------------------------------------------------------------
+LOCK_FILE="/tmp/windroid-shell-runner.lock"
+exec 200>"$LOCK_FILE"
+if ! flock -n 200; then
+    echo "[Windroid OS] Another instance of windroid-shell-runner.sh is already running (PID $(cat "$LOCK_FILE" 2>/dev/null || echo 'unknown')). Exiting duplicate instance." >> "$SHELL_LOG"
+    exit 0
+fi
+echo "$$" > "$LOCK_FILE"
+
 HTTP_PID=""
-BRIDGE_PID=""
 
 cleanup() {
     echo "[Windroid OS] Runner shutting down, performing cleanup..." >> "$SHELL_LOG"
@@ -22,11 +32,7 @@ cleanup() {
         kill "$HTTP_PID" 2>/dev/null || true
         wait "$HTTP_PID" 2>/dev/null || true
     fi
-    if [ -n "$BRIDGE_PID" ] && kill -0 "$BRIDGE_PID" 2>/dev/null; then
-        echo "[Windroid OS] Terminating System Bridge (PID $BRIDGE_PID)..." >> "$SHELL_LOG"
-        kill "$BRIDGE_PID" 2>/dev/null || true
-        wait "$BRIDGE_PID" 2>/dev/null || true
-    fi
+    rm -f "$LOCK_FILE" 2>/dev/null || true
 }
 
 trap cleanup EXIT INT TERM
@@ -162,17 +168,17 @@ except Exception as e:
             # Verify Native System Bridge on 127.0.0.1:4174 (Authoritatively managed by systemd windroid-bridge.service)
             echo "[Windroid OS] Verifying Native System Bridge on 127.0.0.1:4174..." >> "$SHELL_LOG"
             BRIDGE_READY=0
-            for i in $(seq 1 10); do
+            for i in $(seq 1 15); do
                 if command -v systemctl >/dev/null 2>&1; then
                     if ! systemctl is-active --quiet windroid-bridge.service 2>/dev/null; then
                         systemctl start windroid-bridge.service 2>/dev/null || sudo systemctl start windroid-bridge.service 2>/dev/null || true
                     fi
                 fi
 
-                if python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4174/api/health')" >/dev/null 2>&1; then
+                if python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4174/api/health', timeout=1)" >/dev/null 2>&1; then
                     BRIDGE_READY=1
                     break
-                elif command -v curl >/dev/null 2>&1 && curl -s -f http://127.0.0.1:4174/api/health >/dev/null 2>&1; then
+                elif command -v curl >/dev/null 2>&1 && curl -s -f --max-time 1 http://127.0.0.1:4174/api/health >/dev/null 2>&1; then
                     BRIDGE_READY=1
                     break
                 fi
@@ -182,7 +188,16 @@ except Exception as e:
             if [ "$BRIDGE_READY" -eq 1 ]; then
                 echo "[Windroid OS] Native System Bridge is ready at http://127.0.0.1:4174/" >> "$SHELL_LOG"
             else
-                echo "[WARNING] System Bridge did not respond on 127.0.0.1:4174 via systemd. Proceeding without rogue spawn." >> "$SHELL_LOG"
+                echo "[FATAL] Native System Bridge (windroid-bridge.service) is unavailable on port 4174." >> "$SHELL_LOG"
+                echo "[FATAL] Failing closed to prevent unauthorized or broken execution without bridge." >> "$SHELL_LOG"
+                if command -v zenity >/dev/null 2>&1; then
+                    zenity --error \
+                        --title="Windroid OS System Error" \
+                        --text="Critical Error: Native System Bridge is not responding at http://127.0.0.1:4174/api/health.\n\nCannot start Windroid Desktop Shell without authoritative system bridge." \
+                        --width=420 2>/dev/null || true
+                fi
+                sleep 3
+                continue
             fi
 
             echo "[Windroid OS] Starting local HTTP server on port 4173..." >> "$SHELL_LOG"
@@ -238,12 +253,6 @@ except Exception as e:
                 kill "$HTTP_PID" 2>/dev/null || true
                 wait "$HTTP_PID" 2>/dev/null || true
                 HTTP_PID=""
-            fi
-            if [ -n "$BRIDGE_PID" ] && kill -0 "$BRIDGE_PID" 2>/dev/null; then
-                echo "[Windroid OS] Stopping System Bridge PID $BRIDGE_PID..." >> "$SHELL_LOG"
-                kill "$BRIDGE_PID" 2>/dev/null || true
-                wait "$BRIDGE_PID" 2>/dev/null || true
-                BRIDGE_PID=""
             fi
         elif [ "$SESSION_TYPE" = "installer" ] || [ "$SESSION_TYPE" = "oobe" ]; then
             echo "[FATAL] Chromium binary is missing; required for $SESSION_TYPE Boot Mode." >> "$SHELL_LOG"

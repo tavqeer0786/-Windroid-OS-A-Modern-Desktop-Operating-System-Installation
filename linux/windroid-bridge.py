@@ -407,6 +407,67 @@ def validate_native_installer_state_data(data: dict) -> tuple[bool, str | None]:
 
     return True, None
 
+def validate_desktop_ready(data: dict, check_system: bool = False) -> tuple[bool, str | None]:
+    """
+    Formally validates all invariants for DESKTOP_READY state:
+    1. State is 'DESKTOP_READY'
+    2. installationCompleted is True
+    3. oobeCompleted is True
+    4. userConfig is a valid dictionary with a valid, non-reserved username
+    5. If check_system is True:
+       - User exists in passwd/getent
+       - User home directory exists
+       - LightDM autologin configuration exists and specifies autologin-user=<username>
+       - windroid-oobe is not the autologin user
+    """
+    if not isinstance(data, dict):
+        return False, "State data must be a dictionary"
+    
+    if data.get("state") != "DESKTOP_READY":
+        return False, f"Expected state 'DESKTOP_READY', got '{data.get('state')}'"
+    
+    if data.get("installationCompleted") is not True:
+        return False, "installationCompleted must be true for DESKTOP_READY"
+        
+    if data.get("oobeCompleted") is not True:
+        return False, "oobeCompleted must be true for DESKTOP_READY"
+        
+    u_cfg = data.get("userConfig")
+    if not isinstance(u_cfg, dict):
+        return False, "userConfig must be a valid dictionary"
+        
+    username = str(u_cfg.get("username", "")).strip()
+    if not username or username == "windroid-oobe" or username in RESERVED_SYSTEM_USERNAMES:
+        return False, f"Invalid or reserved username '{username}'"
+        
+    if not re.match(r'^[a-z_][a-z0-9_-]*$', username):
+        return False, f"Username '{username}' contains invalid characters"
+
+    if check_system:
+        ok_getent, out_getent, _ = run_command(["getent", "passwd", username])
+        if not ok_getent or not out_getent.strip():
+            return False, f"Real user '{username}' does not exist in passwd database"
+        
+        user_home = f"/home/{username}"
+        if not os.path.exists(user_home):
+            return False, f"User home directory '{user_home}' does not exist"
+            
+        lightdm_conf = "/etc/lightdm/lightdm.conf.d/80-windroid-autologin.conf"
+        if not os.path.exists(lightdm_conf):
+            return False, f"LightDM autologin config '{lightdm_conf}' does not exist"
+            
+        try:
+            with open(lightdm_conf, "r", encoding="utf-8") as f:
+                content = f.read()
+                if f"autologin-user={username}" not in content:
+                    return False, f"LightDM autologin is not set to '{username}'"
+                if "autologin-user=windroid-oobe" in content:
+                    return False, "LightDM autologin still contains temporary user 'windroid-oobe'"
+        except Exception as e:
+            return False, f"Failed to read LightDM config: {e}"
+
+    return True, None
+
 def load_native_installer_state(target_root="/"):
     primary_filepath = os.path.join(target_root, "var/lib/windroid/installer-state.json")
     backup_filepath = os.path.join(target_root, "var/lib/windroid/installation-state.json")
@@ -684,9 +745,15 @@ def complete_oobe_impl(body: dict):
     save_native_installer_state("/", "OOBE_COMPLETE", {
         "userConfig": {"username": username, "fullName": full_name, "deviceName": device_name}
     })
-    save_native_installer_state("/", "DESKTOP_READY", {
+    final_state = save_native_installer_state("/", "DESKTOP_READY", {
         "userConfig": {"username": username, "fullName": full_name, "deviceName": device_name}
     })
+
+    # Validate DESKTOP_READY invariants
+    d_valid, d_err = validate_desktop_ready(final_state, check_system=False)
+    if not d_valid:
+        _log_installer(f"ERROR: DESKTOP_READY validation failed: {d_err}")
+        return {"success": False, "error": f"State validation failed: {d_err}"}
 
     # Schedule background session transition if running under temporary windroid-oobe account
     def _deferred_session_transition():
